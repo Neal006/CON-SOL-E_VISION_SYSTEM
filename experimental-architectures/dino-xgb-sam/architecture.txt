@@ -1,0 +1,137 @@
+================================================================================
+  DINOv2 + XGBoost + SAM  —  Architecture Document
+================================================================================
+
+Project: CON-SOL-E 5.0 Vision System
+Location: experimental-architectures/dino-xgb-sam/
+Purpose: Multi-class industrial defect detection (Dust, RunDown, Scratch)
+
+================================================================================
+  1. SYSTEM OVERVIEW
+================================================================================
+
+This architecture replaces the Mask R-CNN stage of the sibling pipeline
+(dino-xgb-maskrcnn) with Meta's Segment Anything Model (SAM), creating a
+three-stage pipeline:
+
+    Stage 1:  DINOv2 (Feature Extraction)
+    Stage 2:  XGBoost (Patch-Level Classification)
+    Stage 3:  SAM (Prompted Instance Segmentation)
+
+The key insight is that SAM can be prompted with bounding boxes derived from
+the XGBoost probability map, eliminating the need for training a separate
+instance segmentation network.
+
+================================================================================
+  2. PIPELINE STAGES
+================================================================================
+
+---- Stage 1: DINOv2 Feature Extractor ----
+
+  Identical to the dino-xgb-maskrcnn architecture:
+    Model:        dinov2_vits14 (ViT-Small, patch size 14)
+    Embedding:    384 dimensions per patch
+    Input:        518 x 518 pixels
+    Output:       37 x 37 grid of 384-dim feature vectors
+    Frozen:       Yes
+
+---- Stage 2: XGBoost Patch Classifier ----
+
+  Identical XGBoost configuration:
+    n_estimators  = 600, max_depth = 6, learning_rate = 0.1
+    4 classes: Dust, RunDown, Scratch, Normal
+    NEG_RATIO = 3.5 for class balancing
+    Decision threshold = 0.2 (recall-biased)
+
+  Additional capability:
+    - MLflow experiment tracking integrated
+      Experiment: "multiclass_anomaly_detection"
+      Tracking URI: file-based (local mlruns/ directory)
+
+---- Stage 3: SAM (Segment Anything Model) ----
+
+  Model type:           vit_b (ViT-Base SAM encoder)
+  Checkpoint:           sam_vit_b_01ec64.pth
+  Points per side:      32
+  Pred IoU threshold:   0.65
+  Stability score:      0.80
+
+  How it works:
+    1. XGBoost's per-patch probability map is upsampled to image resolution.
+    2. Connected components above the confidence threshold become bounding
+       boxes.
+    3. Each bounding box is used as a SAM prompt:
+         mask = SAM(image, bbox_prompt)
+    4. SAM returns a high-quality binary mask for each prompted region.
+
+  Why SAM instead of Mask R-CNN:
+    - SAM is a zero-shot / promptable segmentation model — it does not
+      require task-specific training on the defect dataset.
+    - Produces smoother, more accurate boundary masks due to its massive
+      pre-training on 11 million images with 1 billion masks.
+    - Lower integration overhead: only needs bounding box prompts.
+
+================================================================================
+  3. DATA FLOW DIAGRAM
+================================================================================
+
+  Input Image (H×W×3)
+       │
+       ├──────────────────────────┐
+       ▼                          │
+  ┌──────────────────────────┐   │
+  │   DINOv2 ViT-S/14        │   │  ← Frozen encoder
+  │   518×518 → 37×37×384    │   │
+  └──────────────────────────┘   │
+       │                          │
+       ▼                          │
+  ┌──────────────────────────┐   │
+  │   XGBoost Classifier      │   │  ← Patch-level classification
+  │   384-dim → 4-class probs │   │
+  └──────────────────────────┘   │
+       │                          │
+       ▼  (candidate bboxes)      │
+  ┌──────────────────────────┐   │
+  │   SAM (vit_b)             │◄──┘  ← Original image + bbox prompts
+  │   Zero-shot segmentation  │
+  └──────────────────────────┘
+       │
+       ▼
+  Per-Instance Masks + Bounding Boxes + Class Labels + Area (mm²)
+
+================================================================================
+  4. KEY DIFFERENCES FROM DINO-XGB-MASKRCNN
+================================================================================
+
+  ┌────────────────────────┬──────────────────────┬──────────────────────┐
+  │ Aspect                 │ dino-xgb-maskrcnn    │ dino-xgb-sam         │
+  ├────────────────────────┼──────────────────────┼──────────────────────┤
+  │ Mask generation        │ Mask R-CNN (trained)  │ SAM (zero-shot)      │
+  │ Requires training?     │ Yes (Mask R-CNN)      │ No (prompt-based)    │
+  │ Boundary quality       │ Good                  │ Excellent            │
+  │ GPU memory             │ Higher                │ Higher (SAM ViT-B)   │
+  │ Experiment tracking    │ None                  │ MLflow integrated    │
+  │ Inference speed        │ Faster                │ Slower per instance  │
+  └────────────────────────┴──────────────────────┴──────────────────────┘
+
+================================================================================
+  5. DATA SPLIT & EVALUATION
+================================================================================
+
+  Train / Val / Test split:  70% / 15% / 15%
+  Random seed:               42
+  Optuna tuning:             50 trials, 1 hr timeout, 5-fold CV
+
+================================================================================
+  6. DIRECTORY STRUCTURE
+================================================================================
+
+  dino-xgb-sam/
+  ├── config.py
+  ├── dino/
+  ├── xgb/
+  ├── sam/
+  │   └── detect_with_sam.py
+  ├── pipeline/
+  ├── eval/
+  └── outputs/

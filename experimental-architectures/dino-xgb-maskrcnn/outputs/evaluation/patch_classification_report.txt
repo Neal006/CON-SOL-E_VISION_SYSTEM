@@ -1,0 +1,10 @@
+              precision    recall  f1-score   support
+
+        Dust       0.78      0.90      0.84     80506
+     RunDown       0.52      0.90      0.66      5456
+     Scratch       0.33      0.73      0.45      7709
+      Normal       0.94      0.79      0.86    171915
+
+    accuracy                           0.83    265586
+   macro avg       0.64      0.83      0.70    265586
+weighted avg       0.86      0.83      0.84    265586

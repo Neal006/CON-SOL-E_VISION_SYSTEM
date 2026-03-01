@@ -1,0 +1,276 @@
+================================================================================
+  Hole Calibration — Architecture & Mathematical Explanation
+================================================================================
+
+Project: CON-SOL-E 5.0 Vision System
+Location: hole-calibration/
+Purpose: Detect and measure keyhole openings behind car doors using classical
+         image processing, with parameter optimisation via grid search & Optuna.
+
+================================================================================
+  1. SYSTEM OVERVIEW
+================================================================================
+
+A classical computer vision pipeline (no neural networks) that detects
+circular/elliptical holes in grayscale images and measures their physical
+area in mm².
+
+Three scripts implement the system:
+    holehybrid.py         — single-image detection with fixed parameters
+    holehybrid_search.py  — exhaustive grid search over 7 parameters
+    holehybrid_optuna.py  — Bayesian optimisation via Optuna (200 trials)
+
+================================================================================
+  2. PIPELINE ARCHITECTURE
+================================================================================
+
+  Input Image (grayscale)
+       │
+       ▼
+  ┌─────────────────────────────┐
+  │  Gaussian Blur (5×5)         │  Noise suppression
+  └─────────────────────────────┘
+       │
+       ├──────────────────────────────────────────┐
+       ▼                                           ▼
+  ┌────────────────────┐                   ┌────────────────────┐
+  │ DARK REGION DETECT  │                   │ EDGE DETECTION      │
+  │ Otsu → scale × 0.7  │                   │ Sobel + Canny fused │
+  └────────────────────┘                   └────────────────────┘
+       │                                           │
+       ▼                                           ▼
+  ┌────────────────────────────────────────────────────────┐
+  │  HOLE INTERIOR = dark_mask AND NOT(edges_fused)         │
+  └────────────────────────────────────────────────────────┘
+       │
+       ▼
+  ┌────────────────────┐
+  │ Morphological Clean │  Open (7×7) → Close (13×13)
+  └────────────────────┘
+       │
+       ▼
+  ┌────────────────────┐
+  │ Contour Filtering   │  Area + Circularity constraints
+  └────────────────────┘
+       │
+       ▼
+  Detected holes with area in mm²
+
+================================================================================
+  3. MATHEMATICAL EXPLANATION — WHY EACH STEP WORKS
+================================================================================
+
+---- 3.1 Gaussian Blur ----
+
+  Mathematical operation:
+    G(x,y) = (1 / 2πσ²) × exp(−(x² + y²) / 2σ²)
+    blurred = image ⊛ G    (⊛ = 2D convolution)
+
+  Kernel: 5×5, σ ≈ 1.1 (OpenCV auto from kernel size)
+
+  WHY IT WORKS:
+    Industrial images have sensor noise and micro-texture on metal surfaces.
+    Gaussian blur acts as a low-pass filter, attenuating high-frequency noise
+    while preserving the larger-scale intensity transitions that define hole
+    boundaries.  The 5×5 kernel is large enough to suppress noise but small
+    enough to preserve the edges of holes (~50-200px diameter).
+
+---- 3.2 Adaptive Dark Thresholding (Otsu × 0.7) ----
+
+  Step 1 — Otsu's method:
+    Finds the threshold T that minimises the intra-class variance:
+      σ²_w(T) = w_0(T) × σ²_0(T) + w_1(T) × σ²_1(T)
+    where w_0, w_1 are the class probabilities and σ²_0, σ²_1 are the
+    class variances for foreground/background.
+
+  Step 2 — Scale by 0.7:
+    dark_thresh = Otsu_threshold × 0.7
+
+  Step 3 — Binary inverse threshold:
+    dark_mask(x,y) = 255  if pixel(x,y) < dark_thresh
+                     0    otherwise
+
+  WHY IT WORKS:
+    Holes are voids — they appear significantly darker than the surrounding
+    metal surface because light passes through or is absorbed rather than
+    reflected.  Otsu's method automatically adapts to the image's intensity
+    distribution, handling varying illumination conditions.
+
+    The 0.7 scaling factor is critical:
+    - Otsu separates "bright surface" from "dark features"
+    - But shadows, oil stains, and paint variations also create dark regions
+    - Multiplying by 0.7 lowers the threshold to capture ONLY the darkest
+      regions — truly deep holes — while rejecting moderate-darkness features
+    - This was validated across the dataset: 0.7 consistently isolates hole
+      interiors while excluding surface contamination
+
+---- 3.3 Dual Edge Detection (Sobel + Canny Fusion) ----
+
+  Sobel gradient magnitude:
+    G_x = image ⊛ S_x   (horizontal Sobel kernel, ksize=3)
+    G_y = image ⊛ S_y   (vertical Sobel kernel, ksize=3)
+    |G| = √(G_x² + G_y²)
+    sobel_binary = threshold(|G_normalised|, 80)
+
+  Canny edge detection:
+    1. Gradient magnitude and direction from Sobel
+    2. Non-maximum suppression (thin edges to 1px)
+    3. Hysteresis thresholding: low=20, high=150
+
+  Fusion:
+    edges_fused = bitwise_OR(sobel_binary, canny)
+    edges_fused = dilate(edges_fused, 3×3 kernel, 1 iteration)
+
+  WHY IT WORKS:
+    Sobel and Canny detect complementary edge types:
+
+    SOBEL captures:
+    - Strong, broad intensity transitions (hole rim to surface)
+    - Responds to the MAGNITUDE of the gradient
+    - More robust to noise but produces thicker edges
+
+    CANNY captures:
+    - Fine, precise edges with 1-pixel width
+    - The hysteresis thresholding (20, 150) ensures weak edges are kept
+      ONLY if connected to strong edges — ideal for continuous hole contours
+
+    Fusing both (OR) creates a COMPLETE edge map:
+    - Canny finds the thin, precise boundary
+    - Sobel fills in any gaps where the gradient is strong but continuous
+
+    Dilation (3×3): Ensures the edge boundary is a solid ring with no
+    micro-gaps through which the dark mask could leak.
+
+---- 3.4 Hole Interior Extraction ----
+
+  hole_interior = dark_mask AND NOT(edges_fused)
+
+  WHY IT WORKS:
+    This Boolean operation is the core insight of the algorithm:
+
+    1. dark_mask captures ALL dark regions (holes + shadows + edges)
+    2. edges_fused captures all boundary transitions
+    3. Subtracting edges from the dark mask removes:
+       - The transition zones at hole rims (dark due to shadowing)
+       - Dark edges between surface features
+       - Linear dark features (scratches, seams)
+    4. What remains: ONLY the interior fill of holes — flat dark regions
+       surrounded by but not including the boundary ring
+
+    This effectively separates "interior dark" from "edge dark," which is
+    exactly the distinction between a hole and a shadow or surface defect.
+
+---- 3.5 Morphological Cleaning ----
+
+  Opening (7×7): erosion → dilation
+    - Removes small noise regions smaller than 7×7
+    - Preserves hole regions (much larger)
+
+  Closing (13×13): dilation → erosion
+    - Fills small internal gaps within holes
+    - Smooths jagged contour boundaries
+    - Merges nearby fragments that belong to the same hole
+
+  WHY THESE KERNEL SIZES WORK:
+    - 7×7 open: Noise spots from sensor artifacts are typically <50px².
+      A 7×7 = 49px structural element removes them entirely while holes
+      (thousands of pixels) barely change shape.
+    - 13×13 close: Hole interiors may have small bright spots (reflections
+      off internal surfaces). Closing with 13×13 fills these while the
+      larger kernel prevents over-fragmentation of genuinely separate holes.
+
+---- 3.6 Contour Filtering (Area + Circularity) ----
+
+  For each contour:
+    area = contourArea(contour)
+    perimeter = arcLength(contour, closed=True)
+    circularity = 4π × area / perimeter²
+
+  Filtering criteria:
+    MIN_AREA    = 300 px²     (reject tiny noise)
+    MAX_AREA    = image_area   (reject full-image blobs)
+    MIN_CIRC    = 0.4          (reject non-circular shapes)
+
+  WHY CIRCULARITY WORKS:
+    Circularity = 4π × A / P²  ranges from 0 to 1:
+    - Perfect circle: C = 1.0
+    - Square: C ≈ 0.785
+    - Elongated scratch: C ≈ 0.1–0.3
+    - Irregular blob: C < 0.4
+
+    Keyholes are round or slightly elliptical → C > 0.4 always.
+    This single metric eliminates:
+    - Linear defects (scratches)
+    - Irregular shadows
+    - Surface contamination (typically amorphous)
+
+---- 3.7 Area Measurement ----
+
+  pixel_area_mm2 = pixel_count × PX_TO_MM2
+  PX_TO_MM2 = 0.0037 mm² per pixel
+
+  This calibration constant converts the exact pixel count of each
+  detected hole contour into physical area for quality control reporting.
+
+================================================================================
+  4. PARAMETER OPTIMISATION
+================================================================================
+
+  ---- Grid Search (holehybrid_search.py) ----
+
+  Exhaustively evaluates all combinations of:
+    Sobel threshold:      [20, 40, 60, 80]
+    Canny low:            [20, 30, 50]
+    Canny high:           [80, 100, 150]
+    Open kernel:          [3, 5, 7]
+    Close kernel:         [5, 9, 13]
+    Min area:             [200, 500, 1000]
+    Max area ratio:       [1%, 3%, 10%]
+
+  Total combinations: ~11,000+ (after pruning invalid canny_lo >= canny_hi)
+  Sorted by: most holes found, then highest average circularity
+
+  Best results consistently show:
+    - Sobel=40-80, Canny=20/80-150, Open=7, Close=9-13
+    - Detected holes have circularity ≈ 0.71 (nearly circular)
+
+  ---- Optuna Search (holehybrid_optuna.py) ----
+
+  Bayesian optimisation using Tree-structured Parzen Estimator (TPE):
+    Sampler:     TPESampler (seed=42)
+    Trials:      200
+    Direction:   maximize
+    Objective:   average circularity across ALL images + bonus for
+                 single-hole-per-image detection − penalty for missed images
+
+  Search space (continuous/discrete):
+    sobel_t:         10 – 120
+    canny_lo:        10 – 80
+    canny_hi:        80 – 220
+    open_k:          3 – 13 (step=2, odd only)
+    close_k:         5 – 19 (step=2, odd only)
+    min_area:        50 – 3000
+    max_area_pct:    0.3% – 20%
+
+  Performance optimisations:
+    - All images pre-loaded into RAM (fast trial evaluation)
+    - Dark mask and Sobel magnitude pre-computed (fixed per image)
+    - Only thresholding/morphology/filtering change per trial
+
+  WHY OPTUNA WORKS BETTER THAN GRID SEARCH:
+    Grid search evaluates uniformly spaced points — it misses the optima
+    that lie between grid points.  TPE models the relationship between
+    hyperparameters and the objective as a probability distribution,
+    focusing search on promising regions.  With 200 trials it explores
+    ~200 points in a continuous 7-dimensional space, vs grid search's
+    fixed lattice.
+
+================================================================================
+  5. KEY FILES
+================================================================================
+
+  hole-calibration/
+  ├── holehybrid.py           # Core pipeline (fixed params, single image)
+  ├── holehybrid_search.py    # Exhaustive grid search
+  ├── holehybrid_optuna.py    # Bayesian optimisation (200 trials)
+  └── best_params.txt         # Top 20 grid search results

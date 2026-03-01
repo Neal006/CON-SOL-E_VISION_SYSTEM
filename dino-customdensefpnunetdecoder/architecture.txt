@@ -1,0 +1,214 @@
+================================================================================
+  DINOv2 + Custom Dense FPN-UNet Decoder — Architecture Document
+================================================================================
+
+Project: CON-SOL-E 5.0 Vision System
+Location: dino-customdensefpnunetdecoder/
+Purpose: Multi-class semantic segmentation for industrial defect detection
+         (Background, Dust, RunDown, Scratch)
+
+This is the PRIMARY production architecture of the vision system.
+
+================================================================================
+  1. ARCHITECTURE OVERVIEW
+================================================================================
+
+An encoder-decoder segmentation model:
+
+    Encoder:  Frozen DINOv2 ViT-B/14 (Vision Transformer Base, patch 14)
+    Decoder:  Custom multi-scale CNN decoder with FPN-like skip connections
+
+The encoder extracts rich semantic features at multiple depths while the
+decoder progressively upsamples them back to full resolution using skip
+connections from intermediate transformer layers — combining the
+hierarchical feature philosophy of Feature Pyramid Networks (FPN) with
+the progressive upsampling of U-Net.
+
+================================================================================
+  2. ENCODER: DINOv2 ViT-B/14
+================================================================================
+
+  Model:                dinov2_vitb14
+  Parameters:           ~86 million
+  Trainable:            0 (frozen by default) or 86M (unfrozen)
+  Embedding dimension:  768
+  Attention heads:      12 (d_k = 64 per head)
+  Transformer blocks:   12 (indexed 0–11)
+  Patch size:           14 × 14
+  Input resolution:     518 × 518
+  Patch grid:           37 × 37 = 1,369 patches
+
+  Patch Embedding:
+    1. Image is divided into 14×14 non-overlapping patches.
+    2. Each patch (14×14×3 = 588 values) is linearly projected to 768 dims.
+    3. A learnable [CLS] token is prepended.
+    4. Learnable 2D positional embeddings are added.
+    5. Final input: (B, 1370, 768)
+
+  Transformer blocks (each):
+    ┌─ LayerNorm → Multi-Head Self-Attention (12 heads) → Residual ──┐
+    └─ LayerNorm → FFN (768→3072→768, GELU) → Residual ─────────────┘
+    Parameters per block: ~7.08M
+
+  Multi-scale feature extraction via forward hooks:
+    ┌──────────┬──────────────────────────────────────────────────────┐
+    │ Hook     │ Feature Type                                        │
+    ├──────────┼──────────────────────────────────────────────────────┤
+    │ Layer 3  │ Shallow — edges, textures, local patterns           │
+    │ Layer 7  │ Mid — parts, object components, texture combos      │
+    │ Layer 11 │ Deep — semantic concepts, global context             │
+    └──────────┴──────────────────────────────────────────────────────┘
+    All layers output (B, 768, 37, 37) after removing [CLS] and reshaping.
+
+  KEY INSIGHT: Unlike CNNs, ViT maintains CONSTANT spatial resolution
+  (37×37) at all depths. The skip connections carry features of
+  increasing semantic depth, not decreasing spatial resolution.
+
+================================================================================
+  3. DECODER: Custom Multi-Scale CNN
+================================================================================
+
+  Design philosophy:
+    - Recover resolution: 37×37 → 518×518 via four 2× upsampling stages
+    - Fuse multi-scale information from encoder hooks
+    - Reduce channels progressively: 768 → 256 → 128 → 64 → 64
+
+  ---- Convolutional Block (building unit) ----
+
+    1×1 Conv (channel projection, no bias)
+      → GroupNorm (32 groups)
+        → GELU activation
+          → 3×3 Conv (spatial processing, padding=1, no bias)
+            → GroupNorm (32 groups)
+              → GELU activation
+                → Dropout2D (p=0.1)
+
+  GroupNorm is used instead of BatchNorm because:
+    - Batch-size independent (critical for batch_size=4-8)
+    - Stable during gradient accumulation
+    - Consistent behaviour between training and inference
+
+  ---- Four Decoder Stages ----
+
+  ┌─────────┬────────────────┬──────────┬────────────┬──────────────┐
+  │ Stage   │ Input          │ Skip     │ Out Ch.    │ Out Size     │
+  ├─────────┼────────────────┼──────────┼────────────┼──────────────┤
+  │ Stage 1 │ deep (768)     │ None     │ 256        │ 74×74        │
+  │ Stage 2 │ prev (256)     │ mid (768)│ 128        │ 148×148      │
+  │ Stage 3 │ prev (128)     │ shal(768)│ 64         │ 296×296      │
+  │ Stage 4 │ prev (64)      │ None     │ 64         │ 592×592      │
+  └─────────┴────────────────┴──────────┴────────────┴──────────────┘
+
+  Resolution chain: 37 →×2→ 74 →×2→ 148 →×2→ 296 →×2→ 592 → resize → 518
+
+  Skip connection logic:
+    1. Bilinear-interpolate skip feature to match decoder spatial size.
+    2. Concatenate along channel dimension (e.g., 256+768 = 1024 ch input).
+    3. Conv block reduces back to target channels.
+
+  ---- Segmentation Head ----
+    1×1 Conv: 64 → num_classes (4)
+    Bilinear interpolation → 518 × 518
+
+  Weight initialisation: Kaiming (He) normal for Conv2d layers.
+
+================================================================================
+  4. LOSS FUNCTION
+================================================================================
+
+  Combined objective:
+    L_total = 0.5 × L_dice + 0.5 × L_focal
+
+  ---- Dice Loss ----
+    L_dice = 1 − (2 × intersection + ε) / (prediction_sum + target_sum + ε)
+    Computed per-class, averaged across all C classes.
+    Directly optimises the IoU-like overlap metric.
+
+  ---- Focal Loss ----
+    L_focal = −α × (1 − p_t)^γ × log(p_t)
+    α = 0.25,  γ = 2.0
+    Down-weights easy (well-classified) examples, focuses on hard ones.
+
+  Class weights: [0.3, 3.0, 1.5, 1.5]
+    Background=0.3 (dominant, down-weighted)
+    Dust=3.0       (rarest defect, 10× weight vs background)
+    RunDown=1.5
+    Scratch=1.5
+
+================================================================================
+  5. TRAINING CONFIGURATION
+================================================================================
+
+  Optimizer:     AdamW (lr=1e-5, weight_decay=0.01)
+  Scheduler:     Cosine Annealing with Warm Restarts
+                 T_0 ≈ 66 epochs, T_mult=2, η_min=1e-6
+  Warmup:        20 epochs
+  Epochs:        200
+  Batch size:    8
+  Gradient clip: max_norm=1.0
+
+  Mixed precision training (AMP):
+    - FP16 forward pass, FP32 loss scaling
+    - ~50% memory reduction, ~2× speedup
+
+  Early stopping: patience=5, min_delta=0.001 (on validation IoU)
+
+  Data augmentation (Albumentations):
+    Horizontal flip (p=0.5), Vertical flip (p=0.3),
+    Rotation ±15° (p=0.5), Brightness/Contrast ±20% (p=0.5),
+    Gaussian blur kernel 3-7 (p=0.3), Coarse dropout 1-8 holes (p=0.3),
+    Elastic transform (p=0.3), CLAHE clip_limit=2.0 (p=0.3)
+
+  ImageNet normalisation: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+
+  Data split: 80% train / 10% val / 10% test
+
+================================================================================
+  6. EVALUATION METRICS
+================================================================================
+
+  Primary:    Mean IoU (mIoU)
+  Secondary:  Dice coefficient, Pixel accuracy
+  Boundary:   Boundary-tolerant IoU (morphological dilation tolerance)
+  Instance:   Instance detection rate
+  Boundary:   Average boundary distance
+
+================================================================================
+  7. MODEL PARAMETER COUNT
+================================================================================
+
+  ┌──────────────────────────┬──────────┬───────────┐
+  │ Component                │ Params   │ Trainable │
+  ├──────────────────────────┼──────────┼───────────┤
+  │ DINOv2 ViT-B/14 Encoder  │ ~86M     │ 0 (frozen)│
+  │ Multi-Scale CNN Decoder   │ ~2.5M    │ 2.5M      │
+  │ TOTAL                     │ ~88.5M   │ ~2.5M     │
+  └──────────────────────────┴──────────┴───────────┘
+
+  GPU Memory:
+    Encoder frozen: ~8 GB (batch=8)
+    Encoder unfrozen: ~16 GB (batch=4)
+    With gradient checkpointing: ~12 GB (batch=8)
+
+================================================================================
+  8. DIRECTORY STRUCTURE
+================================================================================
+
+  dino-customdensefpnunetdecoder/
+  ├── configs/
+  ├── models/
+  │   ├── encoder.py
+  │   ├── decoder.py
+  │   └── model.py
+  ├── loss/
+  │   └── losses.py
+  ├── utils/
+  ├── data/
+  ├── train.py
+  ├── evaluate.py
+  ├── inference.py
+  ├── standalone_inference.py
+  ├── export_model.py
+  ├── final_mecup.py
+  ├── technical_brief.txt
+  └── requirements.txt

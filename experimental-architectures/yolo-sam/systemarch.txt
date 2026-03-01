@@ -1,0 +1,146 @@
+Dataset Structure:
+train/
+images/
+labels/
+test/
+images/
+labels/
+
+Split: 70:30 train:test
+Annotation Format:
+2 0.38310208333333334 0.07650740740740741 0.18634236111111113 0.9613268518518518 0.19791666666666666 0.9721361111111111 0.4166666666666667 0.07021574074074075 0.38310208333333334 0.07650740740740741
+
+Label Decoding Pipeline:
+1. Read the label file
+2. Decode the label file
+3. Return the decoded label file
+Expected Output:
+Axis-aligned bounding boxes used as segmentation prompts for SAM.
+
+Image Input Pipeline:
+Raw Input -> single grayscale images -> Shape: (H,W,1) 
+Pixel intensity represents:
+surface reflectance
+micro-texture
+illumination gradients
+No color semantics exist
+All defect cues are structural and textural, not chromatic.
+
+Pre-processing:
+Channel Handling
+- Image duplicated to 3 channels only for model compatibility 
+- gray -> [gray, gray, gray]
+~ No new information is introduced.
+
+Yolov8 Detector:
+Internal Operations on Grayscale Input;
+Backbone (CSP-style CNN)
+Learns:
+intensity edges
+streaks
+local texture breaks
+Grayscale simplifies early convolution filters
+Faster convergence on small datasets
+Neck (FPN + PAN)
+Multi-scale fusion enables:
+| Feature Scale   | Detects        |
+| --------------- | -------------- |
+| High-resolution | thin scratches |
+| Medium          | dust clusters  |
+| Low             | rundown spread |
+Recall-first Training Strategy:
+Confidence Threshold : 0.35
+NMS IoU : 0.7
+YOLO Output:
+for each image:
+{
+  bbox_i = (x_min, y_min, x_max, y_max)
+  class_i ∈ {Scratch, Dust, Rundown}
+  confidence_i
+}
+What should happen at this stage:
+Boundaries are rough
+Some false positives exist
+True defects are rarely missed
+
+SAM-Guided Instance Segmentation (Grayscale-Robust)
+Prompt Construction
+For each YOLO detection:
+Bounding box → SAM prompt
+Grayscale image passed as:
+[gray, gray, gray]
+mask_i = SAM(image, bbox_prompt_i)
+
+SAM Output:
+for each bounding box:
+binary mask_i ∈ {0,1}^{H×W}
+Each mask corresponds to one defect instance
+
+Post-Segmentation Instance Processing
+Thresholding
+Convert probability masks → binary
+Connected Component Analysis
+Separates:
+multiple scratches
+clustered dust particles
+fragmented rundown regions
+
+Bounding Box Generation (Geometry-Derived)
+For each connected defect region:
+x_min = min(x_pixels)
+x_max = max(x_pixels)
+y_min = min(y_pixels)
+y_max = max(y_pixels)
+Result:
+Tight boxes
+Pixel-accurate
+Derived from actual defect extent
+
+Pixel Area Computation (Exact)
+For each defect instance:
+pixel_area = count(mask == 1)
+Properties:
+Exact
+Stable
+Fully deterministic
+
+Pixel to mm2 conversion:
+mm2_per_pixel = 0.03
+
+Evaluation Metrics:
+Detection Metrics:
+Recall (primary Metric):
+Precision
+Box IoU
+Miss rate
+Segmentation Metrics:
+Mask IoU
+Dice score
+Boundary accuracy
+Physical Metrics:
+Area error (%)
+Median mm² deviation
+Per-class measurement accuracy
+
+CSV Evaluation Format :
+| Class   | IoU | Dice | Area Error (%) | Recall |
+| ------- | --- | ---- | -------------- | ------ |
+| Scratch |     |      |                |        |
+| Dust    |     |      |                |        |
+| Rundown |     |      |                |        |
+
+Evaluation Summary:
+Mean IoU (per class + overall)
+Dice score
+Area error in mm²
+Instance recall (>95% target)
+Box IoU
+Boundary accuracy
+
+Key Points:
+Grayscale-optimized defect detection pipeline
+Recall-biased YOLOv8 localization
+Bounding-box-prompted SAM segmentation
+Geometry-derived bounding boxes
+Physical mm² defect measurement
+Robust performance on limited grayscale data

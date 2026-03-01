@@ -1,0 +1,204 @@
+================================================================================
+  YOLOv8 + SAM  —  Architecture Document
+================================================================================
+
+Project: CON-SOL-E 5.0 Vision System
+Location: experimental-architectures/yolo-sam/
+Purpose: Recall-biased defect detection and instance segmentation on
+         grayscale industrial images (Dust, RunDown, Scratch)
+
+================================================================================
+  1. SYSTEM OVERVIEW
+================================================================================
+
+A two-model cascade pipeline optimised for single-channel (grayscale)
+industrial imaging:
+
+    Stage 1:  YOLOv8 detector  →  coarse bounding boxes (recall-first)
+    Stage 2:  SAM segmenter    →  precise instance masks (prompted by boxes)
+    Stage 3:  Post-processing  →  connected components, area in mm²
+
+This is the most production-oriented architecture in the experimental set,
+featuring MLflow tracking, Optuna hyperparameter tuning, and a comprehensive
+evaluation suite.
+
+================================================================================
+  2. INPUT CHARACTERISTICS
+================================================================================
+
+  Image type:     Single-channel grayscale
+  Channel handling: gray → [gray, gray, gray]  (for 3-channel model compat.)
+  Pixel semantics:
+    - Surface reflectance
+    - Micro-texture
+    - Illumination gradients
+    - No colour information (all defect cues are structural/textural)
+
+================================================================================
+  3. PIPELINE STAGES
+================================================================================
+
+---- Stage 1: YOLOv8 Detector ----
+
+  Model:        yolov8n-seg (nano variant for speed + Colab compatibility)
+  Strategy:     Recall-first — intentionally over-detect
+
+  Backbone (CSP-style CNN):
+    On grayscale input, learns:
+    - Intensity edges
+    - Streaks
+    - Local texture breaks
+    Advantage: grayscale simplifies early convolution filters →
+    faster convergence on small datasets.
+
+  Neck (FPN + PAN multi-scale fusion):
+    ┌──────────────────────────────────────────────────┐
+    │ Feature Scale   │ Detects                        │
+    ├──────────────────────────────────────────────────┤
+    │ High-resolution │ Thin scratches                 │
+    │ Medium          │ Dust clusters                  │
+    │ Low             │ Rundown spread                 │
+    └──────────────────────────────────────────────────┘
+
+  Detection thresholds:
+    Confidence:  0.20  (very low — recall-biased)
+    NMS IoU:     0.7
+
+  Training configuration:
+    Epochs:          100
+    Batch size:      8 (reduced for Colab T4)
+    Image size:      640
+    Optimizer:       SGD (lr=0.01, momentum=0.937, nesterov=True)
+    Augmentations:   mosaic=1.0, degrees=±10, scale=0.5,
+                     flipud=0.5, fliplr=0.5, hsv_v=0.4
+                     (hsv_h=0.0 since grayscale)
+
+  Output per image:
+    { bbox_i = (x_min, y_min, x_max, y_max),
+      class_i ∈ {Dust, RunDown, Scratch},
+      confidence_i }
+
+  Expected behaviour at this stage:
+    ✓ Boundaries are rough
+    ✓ Some false positives exist
+    ✓ True defects are rarely missed
+
+---- Stage 2: SAM Instance Segmentation ----
+
+  Model:         vit_b (ViT-Base SAM encoder)
+  Prompt type:   Bounding box (from YOLO detections)
+  Mask threshold: 0.5
+  Pred IoU:      0.88
+  Stability:     0.95
+
+  Procedure:
+    For each YOLO detection:
+      1. Bounding box → SAM prompt
+      2. Grayscale image (as 3-ch) → SAM encoder
+      3. mask_i = SAM(image, bbox_prompt_i)
+      4. Output: binary mask ∈ {0,1}^{H×W}
+
+---- Stage 3: Post-Processing ----
+
+  a) Binary thresholding:
+     Probability masks → binary (threshold=0.2)
+
+  b) Connected component analysis:
+     Connectivity:        8-connected
+     Min component size:  50 pixels
+     Morphology kernel:   3×3
+     Purpose: separate clustered dust, fragmented rundown,
+              overlapping scratches
+
+  c) Bounding box generation (geometry-derived):
+     For each connected region:
+       x_min, x_max, y_min, y_max = extent of mask == 1
+     → Tight, pixel-accurate boxes
+
+  d) Area computation:
+     pixel_area = count(mask == 1)      ← exact, fully deterministic
+     mm²_area   = pixel_area × 0.03    ← mm² per pixel calibration
+
+================================================================================
+  4. HYPERPARAMETER TUNING (Optuna)
+================================================================================
+
+  Trials:           50
+  Timeout:          12 hours
+  Pruning:          Enabled
+  Optimisation:     Maximize recall
+
+  Search space:
+    ┌────────────────────────┬──────────┬──────────┐
+    │ Parameter              │ Min      │ Max      │
+    ├────────────────────────┼──────────┼──────────┤
+    │ Learning rate          │ 1e-5     │ 1e-3     │
+    │ Confidence threshold   │ 0.15     │ 0.50     │
+    │ NMS IoU threshold      │ 0.40     │ 0.75     │
+    │ Batch size             │ 4        │ 16       │
+    │ SAM mask threshold     │ 0.15     │ 0.70     │
+    └────────────────────────┴──────────┴──────────┘
+
+================================================================================
+  5. EVALUATION METRICS
+================================================================================
+
+  Detection:
+    - Recall (PRIMARY metric — target > 95%)
+    - Precision
+    - Box IoU
+    - Miss rate
+
+  Segmentation:
+    - Mask IoU
+    - Dice score
+    - Boundary accuracy
+
+  Physical:
+    - Area error (%)
+    - Median mm² deviation
+    - Per-class measurement accuracy
+
+  CSV output format:
+    | Class   | IoU | Dice | Area Error (%) | Recall |
+    |---------|-----|------|----------------|--------|
+
+================================================================================
+  6. KEY DESIGN DECISIONS
+================================================================================
+
+  1. Grayscale-first design:
+     All defect cues are structural — colour adds no information for
+     this industrial application.  Grayscale reduces model complexity.
+
+  2. YOLO for speed, SAM for quality:
+     YOLO runs in real-time (~30 FPS on T4); SAM refines each
+     detection into a pixel-accurate mask.
+
+  3. Recall-biased detection:
+     Low confidence threshold (0.20) ensures near-zero miss rate.
+     False positives are cheaper than missed defects in QC.
+
+  4. MLflow integration:
+     Full experiment tracking (artifacts, models, confusion matrices,
+     sample predictions) for reproducible research.
+
+================================================================================
+  7. DIRECTORY STRUCTURE
+================================================================================
+
+  yolo-sam/
+  ├── config.py
+  ├── main.py
+  ├── tune.py
+  ├── systemarch.txt
+  ├── yolo26n.pt
+  ├── yolov8n-seg.pt
+  ├── yolo/
+  ├── sam/
+  ├── preprocess/
+  ├── postprocess/
+  ├── eval/
+  ├── mlflow_integration/
+  ├── results/
+  └── runs/

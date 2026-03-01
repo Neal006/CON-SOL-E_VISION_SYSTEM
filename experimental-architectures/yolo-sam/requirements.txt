@@ -1,0 +1,44 @@
+# YOLO + SAM Defect Detection Pipeline
+# Requirements
+
+# Core Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# YOLOv8
+ultralytics>=8.0.0
+
+# SAM (Segment Anything)
+segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
+
+# Image Processing
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+scikit-image>=0.21.0
+
+# Data Handling
+pandas>=2.0.0
+PyYAML>=6.0
+
+# MLflow & Experiment Tracking
+mlflow>=2.9.0
+
+# Hyperparameter Optimization
+optuna>=3.5.0
+optuna-integration  # For MLflow integration
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Utilities
+tqdm>=4.65.0
+python-dotenv>=1.0.0
+
+# Optional: For visualization exports
+kaleido>=0.2.1  # For Plotly static image export
+
+# Development (optional)
+pytest>=7.0.0
+black>=23.0.0

@@ -1,0 +1,71 @@
+New DINOv2+ML+U-Net Architecture
+This point-wise architecture combines representation learning, anomaly detection, and precise segmentation into a single coherent framework that is both scientifically novel and industrially practical.
+1.Input Acquisition & Preprocessing
+High-resolution images of car door surfaces are captured using a fixed industrial camera setup.
+Images are converted to grayscale to suppress color bias and enhance surface texture contrast.(already done through roboflow, no need to code for this)
+Grayscale images are replicated to three channels to match transformer input requirements.
+Standard normalization is applied using ImageNet statistics.
+No resizing is performed to preserve geometric fidelity required for area estimation.
+2.Frozen Self-Supervised Feature Extraction (DINOv2)
+A frozen DINOv2 Vision Transformer backbone is employed as the feature extractor.
+The backbone is pretrained in a self-supervised manner on large-scale image corpora.
+The input image is divided into non-overlapping patches (typically 14×14 pixels).
+Patch embeddings are extracted from multiple transformer layers to capture:
+Low-level texture variations
+Mid-level structural patterns
+High-level semantic context
+The resulting output is a dense patch-wise feature tensor.
+Rationale:
+DINOv2 embeddings exhibit strong sensitivity to surface texture irregularities, making them highly suitable for defect representation under small-data constraints.
+3.Patch-Level Defect Awareness via Classical ML
+Patch embeddings extracted from DINOv2 are reshaped into a 2D feature set.
+A classical machine learning model (e.g., Isolation Forest or XGBoost) is trained using:
+Normal surface patches
+Limited defect patches (if available)
+The ML model outputs an anomaly score for each patch.
+These scores are re-projected to their spatial locations, forming a patch-level anomaly heatmap.
+The heatmap is normalized to the range [0, 1].
+Rationale:
+Classical ML models provide strong out-of-distribution sensitivity and superior generalization to unseen defect types, which is critical in real industrial environments.
+Use XGBoost.
+4.Anomaly Prior Upsampling & Alignment
+The patch-level anomaly heatmap is bilinearly upsampled to match the original image resolution.
+Spatial alignment is ensured to preserve the correspondence between patches and pixel locations.
+The upsampled anomaly map acts as a soft spatial prior, indicating defect-likely regions.
+5.Prior-Guided True Segmentation Network
+A true pixel-wise segmentation network (e.g., U-Net, Attention U-Net, or SegFormer) is employed.
+The anomaly prior is injected into the segmentation network using one of the following mechanisms:
+Attention gating: feature maps are modulated by anomaly intensity
+Loss reweighting: defect-likely pixels receive higher loss contribution
+The segmentation network produces a dense pixel-level defect mask.
+Both binary and multi-class segmentation formulations are supported.
+Rationale:
+The segmentation network refines coarse anomaly localization into precise defect boundaries suitable for metrological analysis.
+6. Post-Processing & Defect Instance Separation
+The predicted segmentation mask is thresholded using an adaptive strategy.
+Morphological operations are applied to remove spurious noise.
+Connected component analysis is used to separate individual defect instances.
+For each instance:
+Bounding box coordinates are computed
+Pixel-accurate masks are retained
+7.Real-World Area Estimation (mm²)
+Camera calibration is performed offline using a known physical reference.
+A pixel-to-millimeter conversion factor is derived.
+For each defect instance:
+Area_mm² = Pixel_Count × (mm_per_pixel)²
+This ensures physically meaningful defect size measurements.
+8.Output Generation & Visualization
+Final outputs include:
+Original image with bounding boxes and segmentation overlays
+Defect type and confidence score
+Defect area in mm²
+Results are exported in both:
+Human-readable visual format
+Machine-readable JSON format for factory systems
+9.Training Strategy
+The DINOv2 backbone remains frozen throughout training.
+Only the segmentation network is optimized.
+Loss functions include:
+Dice Loss
+Binary Cross-Entropy (or Focal Loss for imbalance)
+The anomaly prior is treated as fixed guidance, ensuring training stability.

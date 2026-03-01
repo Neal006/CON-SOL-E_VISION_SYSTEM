@@ -1,0 +1,44 @@
+# Configuration for DINOv2 Segmentation Model
+
+model:
+  encoder: "dinov2_vitb14"
+  encoder_frozen: false
+  skip_layers: [3, 7, 11]
+  decoder_channels: [256, 128, 64]
+  num_classes: 4  # Background + 3 defect classes (Dust, RunDown, Scratch)
+
+training:
+  batch_size: 8
+  num_epochs: 200
+  learning_rate: 0.00001
+  weight_decay: 0.01
+  warmup_epochs: 20
+  gradient_clip: 1.0
+  accumulation_steps: 1
+
+loss:
+  dice_weight: 0.5
+  focal_weight: 0.5
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  class_weights: [0.3, 3.0, 1.5, 1.5]  # Dust at 4x
+
+data:
+  image_size: 518
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  num_workers: 4
+
+augmentation:
+  horizontal_flip: 0.5
+  vertical_flip: 0.3
+  rotation_limit: 15
+  brightness_limit: 0.2
+  contrast_limit: 0.2
+  gaussian_blur_p: 0.3
+
+paths:
+  data_root: "./data"  # Points to mecup_unsupervised/data (contains train/images, train/labels)
+  save_dir: "./checkpoints"
+  log_dir: "./logs"

@@ -1,0 +1,209 @@
+================================================================================
+  SPGS-Net (Semantic Prior-Guided Segmentation Network) — Architecture Document
+================================================================================
+
+Project: CON-SOL-E 5.0 Vision System
+Location: experimental-architectures/spgs-net/
+Purpose: Multi-class defect segmentation with prior-guided attention
+
+================================================================================
+  1. SYSTEM OVERVIEW
+================================================================================
+
+SPGS-Net is a seven-section pipeline that uses a coarse "anomaly prior" from
+a DINOv2 + XGBoost combination to guide a full-resolution Attention U-Net.
+The prior acts as a spatial attention signal, telling the U-Net where to pay
+extra attention for defect boundaries.
+
+    Section 1:  Input Image
+    Section 2:  DINOv2 Feature Extraction
+    Section 3:  XGBoost Patch Classification → Anomaly Heatmap
+    Section 4:  Anomaly Upsampling (heatmap → full resolution prior)
+    Section 5:  Attention U-Net (prior-conditioned segmentation)
+    Section 6:  Instance Separation (connected component analysis)
+    Section 7:  Area Calculation (pixels → mm²)
+
+================================================================================
+  2. DETAILED STAGE DESCRIPTIONS
+================================================================================
+
+---- Section 2: DINOv2 Feature Extractor ----
+
+  Model:          dinov2_vits14 (ViT-Small, patch size 14)
+  Feature dim:    384
+  Feature layers: [3, 6, 11] (multi-scale extraction from early, mid, deep)
+  Frozen:         Yes (FREEZE_BACKBONE = True)
+  Normalisation:  ImageNet mean/std
+
+  The extractor provides two outputs:
+    1. spatial_features: per-patch feature vectors (37 x 37 grid)
+    2. patch_grid: (patch_h, patch_w) tuple for downstream reshaping
+
+---- Section 3: XGBoost Patch Classifier ----
+
+  Objective:     multi:softprob
+  Num classes:   4 (Background, Dust, RunDown, Scratch)
+  n_estimators:  250
+  max_depth:     8
+  subsample:     0.8
+
+  Training:
+    1. DINOv2 extracts spatial features for all training batches.
+    2. Ground-truth masks are downsampled to patch resolution.
+    3. Each patch gets a label from the dominant class in its region.
+    4. XGBoost trains on (feature_384d → class_label) pairs.
+
+  Output:
+    An anomaly heatmap of shape (batch, num_classes, patch_h, patch_w)
+    representing per-patch defect probabilities.
+
+---- Section 4: Anomaly Upsampler ----
+
+  Method:    Bilinear interpolation (align_corners=True)
+  Smoothing: Gaussian filter (kernel=5, sigma=1.0)
+  Input:     Low-resolution heatmap (37 × 37)
+  Output:    Full-resolution prior map matching image size (560 × 560)
+
+  The smoothing step prevents hard patch-boundary artifacts in the
+  upsampled prior, ensuring gradual spatial transitions.
+
+---- Section 5: Attention U-Net ----
+
+  Architecture:
+    Encoder channels: [64, 128, 256, 512, 1024]
+    Input channels:   3 (RGB image)
+    Output channels:  4 (Background + 3 defect classes)
+    Attention gates:  Yes (reduction factor = 2)
+    Prior injection:  "attention" mode
+    Dropout:          0.3
+    Batch norm:       Yes
+
+  How prior injection works:
+    - The upsampled anomaly prior is element-wise multiplied with the
+      skip connections in the U-Net decoder.
+    - Where the prior is high (likely defect), skip features are
+      amplified.
+    - Where the prior is low (likely clean), features are suppressed.
+    - This acts as a soft spatial attention mask guided by the DINOv2 +
+      XGBoost coarse prediction.
+
+  Attention gate mechanism:
+    g (gating signal from decoder) and x (skip connection from encoder)
+    are combined:
+      1. Linear projections: W_g(g) + W_x(x) + bias
+      2. ReLU activation
+      3. Linear projection to single channel → sigmoid
+      4. Element-wise multiplication: x * attention_coefficients
+
+  Loss function (PriorWeightedLoss):
+    - Combined Dice Loss (weight=0.5) + Focal Loss (weight=0.5)
+    - Focal alpha=0.25, gamma=2.0
+    - When USE_PRIOR_REWEIGHT is enabled, the loss at each pixel is
+      scaled by the anomaly prior (PRIOR_REWEIGHT_FACTOR=2.0), making
+      the model pay more attention to regions the prior flagged.
+
+  Training:
+    Optimizer:       AdamW (lr=1e-4, weight_decay=1e-5)
+    Scheduler:       Cosine Annealing (T_max = epochs)
+    Early stopping:  patience=8 epochs
+    Image size:      560 × 560
+
+---- Section 6: Instance Separator ----
+
+  Method: Connected component analysis
+    - Morphology: erosion (1 iter) → dilation (2 iter), kernel=3×3
+    - Minimum defect area: 50 pixels
+    - Connectivity: 8-connected
+
+  Output: list of individual defect instances, each with:
+    - Binary mask
+    - Bounding box
+    - Class label
+    - Confidence (from probability map)
+
+---- Section 7: Area Calculator ----
+
+  Conversion: 0.1 mm per pixel → area_mm2 = pixel_count × (0.1)²
+  Applied to each defect instance from Section 6.
+
+================================================================================
+  3. DATA FLOW DIAGRAM
+================================================================================
+
+  Input Image (H×W×3)
+       │
+       ├──────────────────────────────────────────┐
+       │                                           │
+       ▼                                           │
+  ┌──────────────────┐                            │
+  │  DINOv2 ViT-S/14  │ → 37×37×384 features      │
+  └──────────────────┘                            │
+       │                                           │
+       ▼                                           │
+  ┌──────────────────┐                            │
+  │  XGBoost (4-class)│ → 37×37 anomaly heatmap    │
+  └──────────────────┘                            │
+       │                                           │
+       ▼                                           │
+  ┌──────────────────┐                            │
+  │ Anomaly Upsampler │ → H×W prior map            │
+  └──────────────────┘                            │
+       │ (prior)                                   │
+       │                   (original image)        │
+       ▼                       ▼                   │
+  ┌─────────────────────────────────┐             │
+  │        Attention U-Net           │◄────────────┘
+  │  Encoder → Bottleneck → Decoder  │
+  │  Prior × Skip Connections        │
+  └─────────────────────────────────┘
+       │
+       ▼
+  ┌──────────────────┐
+  │ Instance Separator│ → individual defect regions
+  └──────────────────┘
+       │
+       ▼
+  ┌──────────────────┐
+  │ Area Calculator   │ → mm² per defect
+  └──────────────────┘
+       │
+       ▼
+  Final Output: instances + masks + bboxes + class + area_mm²
+
+================================================================================
+  4. WHY THIS ARCHITECTURE
+================================================================================
+
+  1. The DINOv2 + XGBoost prior provides a "hint" to the U-Net about
+     where defects might be, dramatically improving segmentation accuracy
+     in low-data regimes.
+
+  2. Attention gates in the U-Net allow selective feature propagation
+     from encoder to decoder, preventing irrelevant background features
+     from diluting defect boundary signals.
+
+  3. Prior-weighted loss makes the training focus on the hardest
+     regions — those the prior was uncertain about.
+
+  4. The pipeline is fully modular: each section can be trained,
+     evaluated, or replaced independently.
+
+================================================================================
+  5. DIRECTORY STRUCTURE
+================================================================================
+
+  spgs-net/
+  ├── config.py
+  ├── main.py
+  ├── dino/
+  │   └── feature_extractor.py
+  ├── ml/
+  │   └── xgboost_classifier.py
+  ├── anomaly_upsampling/
+  ├── unet/
+  │   ├── attention_unet.py
+  │   └── losses.py
+  ├── defect_instance/
+  ├── area_est/
+  ├── utils/
+  └── docs/

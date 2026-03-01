@@ -1,0 +1,307 @@
+================================================================================
+  Orange Peel Defect Detection — Architecture & Mathematical Explanation
+================================================================================
+
+Project: CON-SOL-E 5.0 Vision System
+Location: orangepeel-defect-detection/
+Purpose: Detect and quantify "orange peel" surface texture defects on painted
+         automotive panels using classical image processing.
+
+================================================================================
+  1. WHAT IS ORANGE PEEL?
+================================================================================
+
+Orange peel is a paint finish defect where the surface develops a bumpy,
+dimpled texture resembling the skin of an orange.  It is caused by:
+  - Improper paint viscosity
+  - Incorrect spray gun settings (pressure, distance, pattern)
+  - Environmental conditions (temperature, humidity)
+  - Inadequate paint flow and levelling
+
+The defect manifests as high-frequency, low-amplitude surface undulations
+that create subtle intensity variations under directional illumination.
+
+================================================================================
+  2. PIPELINE ARCHITECTURE
+================================================================================
+
+  Input Image (colour)
+       │
+       ▼
+  ┌─────────────────────────────┐
+  │  Grayscale Conversion        │
+  └─────────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────────┐
+  │  CLAHE Enhancement           │  clipLimit=3.0, tileGrid=8×8
+  └─────────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────────┐
+  │  Gaussian Blur (3×3)         │  Mild noise suppression
+  └─────────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────────┐
+  │  Laplacian of Gaussian (LoG) │  Second derivative, ksize=3
+  └─────────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────────┐
+  │  Binary Thresholding         │  threshold=15
+  └─────────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────────┐
+  │  Morphological Cleaning      │  Open(3×3) → Close(7×7)
+  └─────────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────────┐
+  │  Contour Analysis            │  Area filtering (900 < A < 50%)
+  └─────────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────────┐
+  │  Area Aggregation + Verdict  │  Total mm² vs threshold (5.0 mm²)
+  └─────────────────────────────┘
+
+================================================================================
+  3. MATHEMATICAL EXPLANATION — WHY EACH STEP WORKS
+================================================================================
+
+---- 3.1 Grayscale Conversion ----
+
+  gray(x,y) = 0.299 × R + 0.587 × G + 0.114 × B
+
+  WHY IT WORKS:
+    Orange peel is a TEXTURAL defect, not a colour defect.  The surface
+    undulations create intensity variations (light reflecting off bumps at
+    different angles) that are fully captured in the luminance channel.
+    Converting to grayscale:
+    1. Eliminates irrelevant colour variation (paint hue differences)
+    2. Reduces data dimensionality (3 channels → 1 channel)
+    3. Enables direct application of gradient/Laplacian operators
+
+---- 3.2 CLAHE (Contrast Limited Adaptive Histogram Equalisation) ----
+
+  Mathematical formulation:
+    The image is divided into tiles (8×8 grid).
+    Within each tile:
+      1. Compute local histogram
+      2. Clip the histogram at clipLimit=3.0:
+         excess = max(0, histogram_bin - clip_limit)
+         Redistributed uniformly across all bins
+      3. Compute local CDF → local mapping function
+    Between tiles: bilinear interpolation of mapping functions
+
+  WHY IT WORKS:
+    Orange peel texture has very LOW contrast — the bumps create intensity
+    differences of only 3-10 grey levels out of 256.  Standard histogram
+    equalisation would amplify noise globally.  CLAHE solves this:
+
+    1. ADAPTIVE: Each 8×8 tile adapts to its local intensity distribution.
+       Under non-uniform illumination (common in industrial imaging), this
+       ensures bumps in both bright and dark regions are equalised.
+
+    2. CONTRAST LIMITED (clipLimit=3.0): limits the maximum amplification.
+       Without clipping, regions with very uniform intensity would get
+       extreme amplification, creating massive noise.  The clip limit of
+       3.0 means no histogram bin can be more than 3× its fair share,
+       giving a good balance of contrast enhancement vs noise control.
+
+    3. INTER-TILE INTERPOLATION: eliminates visible boundaries between
+       tiles by smoothly blending the local mappings.
+
+    NET EFFECT: Orange peel bumps that were barely visible (3-5 grey levels)
+    become clearly defined (20-40 grey levels), enabling downstream edge
+    detection to reliably find them.
+
+---- 3.3 Gaussian Blur (3×3) ----
+
+  G(x,y) = (1/2πσ²) × exp(−(x²+y²) / 2σ²),  σ ≈ 0.8 for ksize=3
+
+  WHY IT WORKS:
+    After CLAHE amplification, pixel-level sensor noise is also amplified.
+    A minimal 3×3 Gaussian blur removes this high-frequency noise while
+    preserving the orange peel texture pattern, which has a spatial
+    frequency of 5-20 pixels per dimple.
+
+    WHY 3×3 AND NOT LARGER:
+    - 5×5 blur would start to smooth out small orange peel dimples
+    - 3×3 is just enough to suppress noise without affecting the target
+      texture wavelength
+    - The Laplacian operator in the next step is very noise-sensitive,
+      so even minimal smoothing significantly improves its response
+
+---- 3.4 Laplacian of Gaussian (LoG) — THE KEY OPERATOR ----
+
+  Mathematical definition:
+    ∇²I = ∂²I/∂x² + ∂²I/∂y²
+
+  Computed as:
+    log = Laplacian(blurred, CV_64F, ksize=3)
+    log_abs = |log|
+    log_norm = normalise(log_abs, 0, 255)
+
+  The Laplacian kernel (ksize=3):
+    [0  1  0]
+    [1 -4  1]
+    [0  1  0]
+
+  WHY THIS IS THE PERFECT OPERATOR FOR ORANGE PEEL:
+
+    1. SECOND DERIVATIVE RESPONSE:
+       Orange peel creates a surface profile like a sinusoidal function:
+         I(x) ≈ A × sin(2πx/λ)    (A = amplitude, λ = wavelength)
+       First derivative:
+         I'(x) = A × (2π/λ) × cos(2πx/λ)
+       Second derivative (what the Laplacian computes):
+         I''(x) = −A × (2π/λ)² × sin(2πx/λ)
+
+       The second derivative AMPLIFIES the bumps by (2π/λ)² — short-
+       wavelength texture (orange peel, λ ≈ 5-20px) gets amplified far
+       more than long-wavelength gradients (illumination, λ ≈ 100-500px).
+
+    2. ISOTROPIC (rotation-invariant):
+       Orange peel has no preferred direction — bumps are randomly
+       distributed.  The Laplacian responds equally to curvature in ALL
+       directions, unlike Sobel (which is directional).
+
+    3. ZERO-CROSSING PROPERTY:
+       At the boundary between a bump and a valley, the Laplacian crosses
+       zero.  This means the ABSOLUTE VALUE of the Laplacian creates a
+       response map where every bump boundary produces a strong signal,
+       effectively outlining the orange peel texture.
+
+    4. SUPPRESSES UNIFORM REGIONS AND LINEAR GRADIENTS:
+       ∇²(constant) = 0       → smooth paint produces no response
+       ∇²(linear gradient) = 0 → illumination ramps produce no response
+       Only CURVATURE (bumps/dimples) produces a non-zero Laplacian.
+
+    This makes the Laplacian the mathematically ideal detector for a
+    defect defined entirely by surface curvature.
+
+---- 3.5 Binary Thresholding (threshold=15) ----
+
+  rough_mask(x,y) = 255  if log_norm(x,y) > 15
+                    0     otherwise
+
+  WHY 15:
+    After LoG and normalisation to [0,255]:
+    - Clean (smooth) regions: LoG values 0-10 (noise floor)
+    - Orange peel dimples: LoG values 20-100+ (strong curvature response)
+    - Threshold 15 sits just above the noise floor
+
+    This was empirically calibrated: lower values include too much noise,
+    higher values miss subtle orange peel.  The CLAHE enhancement in step
+    3.2 ensures that even subtle orange peel dimples generate LoG responses
+    well above 15, making this threshold robust across images.
+
+---- 3.6 Morphological Cleaning ----
+
+  Opening (3×3 kernel):
+    erosion → dilation
+    Removes isolated pixels and tiny noise clusters smaller than 3×3=9px²
+
+  Closing (7×7 kernel):
+    dilation → erosion
+    Fills small gaps within orange peel texture regions, merging nearby
+    dimple detections into coherent defect zones
+
+  WHY THESE SPECIFC SIZES:
+    - Open 3×3: Orange peel dimples are 5-20px, so 3×3 only removes true
+      noise (1-2px clusters) without affecting real detections
+    - Close 7×7: Adjacent dimples may have 5-10px gaps between them.
+      7×7 closing bridges these gaps, creating connected regions that
+      represent coherent areas of orange peel texture.
+
+---- 3.7 Contour Filtering ----
+
+  MIN_AREA = 900 px²   (≈ 3.33 mm² at the calibration scale)
+  MAX_AREA = 50% of image area
+
+  WHY THESE BOUNDS:
+    - MIN_AREA=900: A single dimple is noise; orange peel is a distributed
+      texture defect.  Requiring 900px² minimum ensures only regions with
+      multiple dimples are reported (at least ~10 dimples clustered
+      together).
+    - MAX_AREA=50%: Prevents reporting the entire image as a single defect
+      (would indicate a systematic issue, not localised orange peel).
+
+---- 3.8 Area Aggregation and Verdict ----
+
+  total_area_mm2 = Σ contourArea(c) × PX_TO_MM2
+  PX_TO_MM2 = 0.0037 mm² per pixel
+
+  Decision logic:
+    if total_area_mm2 > THRESHOLD_MM2 (5.0 mm²):
+        → ORANGE PEEL DETECTED (full-image orange overlay)
+    else:
+        → OK (individual regions annotated with bounding boxes)
+
+  WHY TWO DISPLAY MODES:
+    - When total defective area exceeds the threshold, the orange peel is
+      pervasive enough to fail the panel.  The full-image overlay provides
+      an immediate, unmistakable visual signal to the QC operator.
+    - Below threshold, individual regions are highlighted so operators can
+      monitor emerging trends before they become reject-worthy.
+
+  The batch processing variant (orangepeel_batch.py) uses:
+    THRESHOLD_MM2 = 4.0 mm²  (slightly stricter for batch QC)
+    MIN_AREA = 300 px²        (more sensitive for batch statistics)
+
+================================================================================
+  4. WHY THIS IP PIPELINE WORKS — MATHEMATICAL SUMMARY
+================================================================================
+
+  The fundamental mathematical insight is that orange peel is a
+  SECOND-ORDER INTENSITY PHENOMENON — it is defined by surface curvature,
+  not by absolute brightness or first-order gradients.
+
+  The pipeline is designed around this insight:
+
+    1. CLAHE makes the curvature visible (contrast amplification)
+    2. Gaussian blur removes noise that would corrupt the curvature signal
+    3. Laplacian (∇²) computes the curvature directly
+    4. Thresholding separates curvature from the noise floor
+    5. Morphology connects individual dimple detections into coherent zones
+    6. Area measurement converts pixel detections to physical units
+
+  Each step produces an intermediate result that would be physically
+  meaningless on its own.  Together, they form a chain where:
+    HIGH curvature → HIGH CLAHE-enhanced contrast → HIGH LoG response
+        → ABOVE threshold → REGION with orange peel
+
+  This is why simple edge detection (Sobel, Canny) fails for orange peel:
+  edges are FIRST-ORDER (gradient magnitude), while orange peel needs
+  SECOND-ORDER analysis (gradient change rate = curvature).
+
+================================================================================
+  5. KEY FILES
+================================================================================
+
+  orangepeel-defect-detection/
+  ├── orangepeel.py           # Single-image detection (5.0 mm² threshold)
+  └── orangepeel_batch.py     # Batch processing (4.0 mm² threshold)
+
+================================================================================
+  6. CONFIGURABLE PARAMETERS
+================================================================================
+
+  ┌──────────────────────────┬───────────┬────────────────────────────────┐
+  │ Parameter                │ Value     │ Purpose                        │
+  ├──────────────────────────┼───────────┼────────────────────────────────┤
+  │ CLAHE clipLimit          │ 3.0       │ Contrast amplification cap     │
+  │ CLAHE tileGridSize       │ (8, 8)    │ Local adaptation granularity   │
+  │ Gaussian blur kernel     │ (3, 3)    │ Noise suppression              │
+  │ Laplacian ksize          │ 3         │ Second derivative kernel       │
+  │ Binary threshold         │ 15        │ LoG response cutoff            │
+  │ Morph open kernel        │ (3, 3)    │ Noise removal structuring elem │
+  │ Morph close kernel       │ (7, 7)    │ Gap filling structuring elem   │
+  │ MIN_AREA                 │ 900 px²   │ Minimum defect region size     │
+  │ MAX_AREA                 │ 50% image │ Maximum defect region size     │
+  │ PX_TO_MM2                │ 0.0037    │ Pixels-to-mm² calibration      │
+  │ THRESHOLD_MM2            │ 5.0       │ Pass/fail decision boundary    │
+  └──────────────────────────┴───────────┴────────────────────────────────┘

@@ -1,0 +1,177 @@
+================================================================================
+  DINOv2 + XGBoost + Mask R-CNN  —  Architecture Document
+================================================================================
+
+Project: CON-SOL-E 5.0 Vision System
+Location: experimental-architectures/dino-xgb-maskrcnn/
+Purpose: Multi-class industrial defect detection (Dust, RunDown, Scratch)
+
+================================================================================
+  1. SYSTEM OVERVIEW
+================================================================================
+
+This architecture is a three-stage pipeline that combines self-supervised feature
+extraction, gradient-boosted classification, and instance segmentation:
+
+    Stage 1:  DINOv2 (Feature Extraction)
+    Stage 2:  XGBoost (Patch-Level Classification)
+    Stage 3:  Mask R-CNN (Instance Segmentation & Mask Refinement)
+
+The design philosophy is to use a frozen pre-trained vision backbone (DINOv2) to
+produce semantically rich patch embeddings, train a lightweight XGBoost
+classifier on those embeddings for coarse defect localisation, and then refine
+the detections into pixel-accurate instance masks using Mask R-CNN.
+
+================================================================================
+  2. PIPELINE STAGES
+================================================================================
+
+---- Stage 1: DINOv2 Feature Extractor ----
+
+  Model:        dinov2_vits14 (ViT-Small, patch size 14)
+  Embedding:    384 dimensions per patch
+  Input:        518 x 518 pixels (native DINOv2 resolution)
+  Output:       Per-patch feature vectors (37 x 37 grid = 1369 patches)
+  Frozen:       Yes — no gradient updates; acts as a fixed feature backbone
+
+  How it works:
+    1. Input image is divided into 14×14 non-overlapping patches.
+    2. Each patch is linearly projected to a 384-dim embedding.
+    3. Embeddings pass through 12 transformer blocks with multi-head
+       self-attention (6 heads, d_k = 64 per head).
+    4. Output: a sequence of 1369 contextualized feature vectors,
+       each capturing local texture plus global context.
+
+  Why DINOv2:
+    - Self-supervised pre-training on 142M images (LVD-142M dataset)
+      produces domain-agnostic, high-quality visual features.
+    - No task-specific labels needed during feature extraction.
+    - Rich local patch information preserved (unlike contrastive methods
+      such as CLIP that favour global representations).
+
+---- Stage 2: XGBoost Patch Classifier ----
+
+  Model:        XGBoost (multi:softprob objective)
+  Classes:      4 (Dust, RunDown, Scratch, Normal)
+  Input:        384-dim DINOv2 patch feature vectors
+  Output:       Per-patch class probability distribution
+
+  Hyperparameters:
+    n_estimators          = 600
+    max_depth             = 6
+    learning_rate         = 0.1
+    subsample             = 0.8
+    colsample_bytree      = 1.0
+    min_child_weight      = 1
+    reg_alpha             = 0.01
+    reg_lambda            = 0.5
+    early_stopping_rounds = 20
+    eval_metric           = mlogloss
+
+  Training procedure:
+    1. DINOv2 extracts features for all training images.
+    2. Each patch is assigned a label based on the ground-truth mask at
+       that patch location.
+    3. Normal patches are down-sampled (NEG_RATIO = 3.5) to balance
+       the class distribution.
+    4. XGBoost trains on the resulting (feature, label) pairs.
+
+  Output usage:
+    - Decision threshold: 0.2 (low, to maximise recall)
+    - Confidence threshold: 0.4
+    - Patches classified as defective are converted into coarse
+      bounding boxes / probability maps for Mask R-CNN input.
+
+---- Stage 3: Mask R-CNN (Instance Segmentation) ----
+
+  Backbone:      ResNet-50 (pre-trained on COCO)
+  Score thresh:  0.5
+  NMS thresh:    0.3
+
+  How it works:
+    1. Regions flagged by XGBoost are passed as proposals.
+    2. Mask R-CNN's Region Proposal Network (RPN) generates refined
+       bounding boxes.
+    3. For each box, a small FCN head predicts a binary instance mask.
+    4. Non-Maximum Suppression removes duplicate detections.
+
+  Output:
+    - Per-instance binary masks
+    - Class labels (Dust / RunDown / Scratch)
+    - Confidence scores
+    - Bounding boxes
+
+================================================================================
+  3. DATA FLOW DIAGRAM
+================================================================================
+
+  Input Image (H×W×3)
+       │
+       ▼
+  ┌──────────────────────────┐
+  │   DINOv2 ViT-S/14        │  ← Frozen encoder
+  │   518×518 → 37×37×384    │
+  └──────────────────────────┘
+       │
+       ▼
+  ┌──────────────────────────┐
+  │   XGBoost Classifier      │  ← Patch-level classification
+  │   384-dim → 4-class probs │
+  └──────────────────────────┘
+       │
+       ▼  (candidate regions with class + confidence)
+  ┌──────────────────────────┐
+  │   Mask R-CNN               │  ← Instance segmentation
+  │   ResNet-50 backbone       │
+  │   RPN + ROI Align + Mask   │
+  └──────────────────────────┘
+       │
+       ▼
+  Per-Instance Masks + Bounding Boxes + Class Labels + Area (mm²)
+
+================================================================================
+  4. DATA SPLIT & EVALUATION
+================================================================================
+
+  Train / Val / Test split:  70% / 15% / 15%
+  Random seed:               42
+
+  Hyperparameter tuning:
+    - Optuna (50 trials, 1 hour timeout, 5-fold CV)
+    - Study name: xgboost_optimization
+    - Direction: maximize (evaluation metric)
+
+================================================================================
+  5. KEY DESIGN DECISIONS
+================================================================================
+
+  1. DINOv2 ViT-S (not ViT-B):
+     Chosen for lower memory footprint (22M vs 86M params) while
+     retaining strong feature quality — important for Colab training.
+
+  2. XGBoost as an intermediary:
+     Avoids fine-tuning the ViT entirely.  Training XGBoost on patch
+     features is fast (minutes, not hours) and provides interpretable
+     feature importances.
+
+  3. Mask R-CNN for final masks:
+     Provides instance-level segmentation (separates overlapping
+     defects) rather than semantic segmentation only.
+
+  4. Low decision threshold (0.2):
+     In industrial QC, missed defects are far costlier than false
+     positives.  The pipeline is recall-biased by design.
+
+================================================================================
+  6. DIRECTORY STRUCTURE
+================================================================================
+
+  dino-xgb-maskrcnn/
+  ├── config.py
+  ├── dino/
+  ├── xgb/
+  ├── mask_rcnn/
+  │   └── detect_with_maskrcnn.py
+  ├── pipeline/
+  ├── eval/
+  └── outputs/

@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/Admin/CODING/me_cv/runs/mlflow/649078536596690330/320c76797fbc47a48651d3c91d8fc081/artifacts
+end_time: 1769094691155
+entry_point_name: ''
+experiment_id: '649078536596690330'
+lifecycle_stage: active
+run_id: 320c76797fbc47a48651d3c91d8fc081
+run_name: results
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1769086219513
+status: 3
+tags: []
+user_id: Admin
